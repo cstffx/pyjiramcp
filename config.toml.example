@@ -1,0 +1,5 @@
+[jira]
+server = "https://danngosdev.atlassian.net"
+email = "tu.email@danngos.com"
+token = "TU_TOKEN_API"
+proxy = ""

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pyjiramcp": {
+      "command": "python3",
+      "args": [
+        "/home/user/Desktop/pyjiramcp/mcp_server.py",
+        "--config",
+        "/home/user/Desktop/pyjiramcp/config.toml"
+      ]
+    }
+  }
+}
