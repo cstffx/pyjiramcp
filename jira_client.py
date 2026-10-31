@@ -17,10 +17,33 @@ ADF_NODE_TYPES = {
 
 
 def _text_to_adf(text: str) -> Dict[str, Any]:
-    """Convierte texto plano (párrafos separados por línea en blanco) a un documento ADF mínimo."""
+    """Convierte texto plano (párrafos separados por línea en blanco) a un documento ADF mínimo.
+
+    Las líneas que empiezan con '# ', '## ' o '### ' se convierten en encabezados
+    reales de Jira (heading level 1/2/3) en vez de quedar como texto literal con
+    los símbolos '#' visibles.
+    """
     content = []
     for para in text.split('\n\n'):
         lines = [l for l in para.split('\n')]
+
+        heading_match = None
+        if len(lines) == 1:
+            for prefix, level in (('### ', 3), ('## ', 2), ('# ', 1)):
+                if lines[0].startswith(prefix):
+                    heading_match = (level, lines[0][len(prefix):])
+                    break
+
+        if heading_match:
+            level, heading_text = heading_match
+            if heading_text:
+                content.append({
+                    'type': 'heading',
+                    'attrs': {'level': level},
+                    'content': [{'type': 'text', 'text': heading_text}],
+                })
+            continue
+
         para_content = []
         for i, line in enumerate(lines):
             if i > 0:
