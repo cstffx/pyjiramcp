@@ -8,6 +8,105 @@ import urllib.parse
 from typing import Optional, Dict, Any
 
 
+ADF_NODE_TYPES = {
+    'doc', 'paragraph', 'text', 'bulletList', 'orderedList', 'listItem',
+    'codeBlock', 'heading', 'blockquote', 'rule', 'hardBreak', 'mention',
+    'table', 'tableRow', 'tableCell', 'tableHeader', 'panel', 'emoji',
+    'mediaSingle', 'media', 'inlineCard',
+}
+
+
+def _text_to_adf(text: str) -> Dict[str, Any]:
+    """Convierte texto plano (párrafos separados por línea en blanco) a un documento ADF mínimo."""
+    content = []
+    for para in text.split('\n\n'):
+        lines = [l for l in para.split('\n')]
+        para_content = []
+        for i, line in enumerate(lines):
+            if i > 0:
+                para_content.append({'type': 'hardBreak'})
+            if line:
+                para_content.append({'type': 'text', 'text': line})
+        if para_content:
+            content.append({'type': 'paragraph', 'content': para_content})
+
+    if not content:
+        content = [{'type': 'paragraph', 'content': []}]
+
+    return {'type': 'doc', 'version': 1, 'content': content}
+
+
+def _validate_adf_node(node: Any, path: str) -> None:
+    if not isinstance(node, dict):
+        raise ValueError(
+            f"{path}: cada nodo ADF debe ser un objeto (dict), recibido {type(node).__name__} ({node!r}). "
+            f"Arreglo: envuelve el valor en un nodo, p.ej. {{'type': 'text', 'text': ...}}."
+        )
+
+    node_type = node.get('type')
+    if node_type not in ADF_NODE_TYPES:
+        raise ValueError(
+            f"{path}: tipo de nodo ADF desconocido '{node_type}'. "
+            f"Arreglo: usa uno de los tipos soportados: {sorted(ADF_NODE_TYPES)}."
+        )
+
+    if node_type == 'text' and not isinstance(node.get('text'), str):
+        raise ValueError(
+            f"{path}>text: falta la clave 'text' con un string (tiene: {node.get('text')!r}). "
+            f"Arreglo: {{'type': 'text', 'text': '<contenido>'}}."
+        )
+
+    if node_type == 'codeBlock':
+        attrs = node.get('attrs')
+        if attrs is not None:
+            language = attrs.get('language')
+            if language is None:
+                del node['attrs']
+            elif not isinstance(language, str):
+                raise ValueError(
+                    f"{path}>codeBlock.attrs.language debe ser string (ej: 'python', 'json'), "
+                    f"recibido {type(language).__name__} ({language!r}). "
+                    f"Arreglo: usa un string de lenguaje o elimina 'attrs' por completo."
+                )
+
+    for child in node.get('content') or []:
+        _validate_adf_node(child, path=f"{path}>{node_type}")
+
+
+def validate_description(value: Any) -> Dict[str, Any]:
+    """Normaliza y valida un valor de description antes de enviarlo a Jira.
+
+    Acepta texto plano (se convierte a ADF) o un documento ADF ya construido.
+    Corrige en el momento los problemas conocidos (p.ej. codeBlock.attrs.language=None,
+    que Jira rechaza con HTTP 400 INVALID_INPUT) y lanza ValueError ante estructuras
+    inválidas, antes de llegar a la API.
+    """
+    if isinstance(value, str):
+        return _text_to_adf(value)
+
+    if isinstance(value, dict):
+        if value.get('type') != 'doc' or value.get('version') != 1:
+            raise ValueError(
+                f"description: el documento ADF debe tener type='doc' y version=1 "
+                f"(recibido type={value.get('type')!r}, version={value.get('version')!r}). "
+                f"Arreglo: {{'type': 'doc', 'version': 1, 'content': [...]}}."
+            )
+        if not isinstance(value.get('content'), list):
+            raise ValueError(
+                f"description.content debe ser una lista de nodos, recibido "
+                f"{type(value.get('content')).__name__}. Arreglo: 'content': [{{'type': 'paragraph', ...}}]."
+            )
+        for i, child in enumerate(value['content']):
+            _validate_adf_node(child, path=f'description.content[{i}]')
+        return value
+
+    raise ValueError(
+        f"description: tipo no soportado {type(value).__name__} (recibido: {value!r}). "
+        f"Arreglo: pasa un string de texto plano (se convierte a ADF automáticamente) "
+        f"o un dict ADF completo con {{'type': 'doc', 'version': 1, 'content': [...]}}."
+    )
+
+
 class JiraClient:
     
 
@@ -90,17 +189,17 @@ class JiraClient:
             raise Exception(f"Connection error: {e}")
 
     def get_issue(self, issue_key: str) -> Dict[str, Any]:
-        
-        data = self._make_request('GET', f'/issues/{issue_key}')
+
+        data = self._make_request('GET', f'/issue/{issue_key}')
 
         fields = data.get('fields', {})
         return {
             'key': data.get('key'),
             'summary': fields.get('summary'),
             'description': fields.get('description'),
-            'status': fields.get('status', {}).get('name'),
-            'type': fields.get('issuetype', {}).get('name'),
-            'assignee': fields.get('assignee', {}).get('displayName'),
+            'status': (fields.get('status') or {}).get('name'),
+            'type': (fields.get('issuetype') or {}).get('name'),
+            'assignee': (fields.get('assignee') or {}).get('displayName'),
             'created': fields.get('created'),
             'updated': fields.get('updated'),
         }
@@ -118,13 +217,45 @@ class JiraClient:
         }
 
         if description:
-            payload['fields']['description'] = description
+            payload['fields']['description'] = validate_description(description)
 
-        response = self._make_request('POST', '/issues', payload)
+        response = self._make_request('POST', '/issue', payload)
         return response.get('key', 'Unknown')
 
+    def find_user(self, query: str) -> list:
+        """
+        Buscar usuarios de Jira por email o nombre.
+
+        Args:
+            query: Email o nombre (parcial) a buscar
+
+        Returns:
+            Lista de usuarios encontrados (accountId, displayName, emailAddress)
+        """
+        encoded = urllib.parse.urlencode({'query': query})
+        results = self._make_request('GET', f'/user/search?{encoded}')
+        return [
+            {
+                'accountId': u.get('accountId'),
+                'displayName': u.get('displayName'),
+                'emailAddress': u.get('emailAddress'),
+            }
+            for u in results
+        ]
+
+    def _resolve_account_id(self, value: str) -> str:
+        """Resuelve un email o nombre de usuario a su accountId de Jira Cloud.
+
+        La API Cloud ya no acepta 'name' para identificar usuarios (eso era de
+        Jira Server); el campo assignee necesita 'accountId'.
+        """
+        results = self.find_user(value)
+        if not results:
+            raise ValueError(f"No se encontró ningún usuario de Jira que coincida con '{value}'")
+        return results[0]['accountId']
+
     def update_issue(self, issue_key: str, **fields) -> str:
-        
+
         payload = {'fields': {}}
 
         field_map = {
@@ -138,25 +269,27 @@ class JiraClient:
             if key in fields and fields[key]:
                 value = fields[key]
                 if jira_key == 'assignee':
-                    payload['fields'][jira_key] = {'name': value}
+                    payload['fields'][jira_key] = {'accountId': self._resolve_account_id(value)}
                 elif jira_key == 'status':
                     return self._transition_issue(issue_key, value)
+                elif jira_key == 'description':
+                    payload['fields'][jira_key] = validate_description(value)
                 else:
                     payload['fields'][jira_key] = value
 
         if not payload['fields']:
             return f"No fields to update for {issue_key}"
 
-        self._make_request('PUT', f'/issues/{issue_key}', payload)
+        self._make_request('PUT', f'/issue/{issue_key}', payload)
         return f"Updated {issue_key}"
 
     def _transition_issue(self, issue_key: str, target_status: str) -> str:
         
-        transitions = self._make_request('GET', f'/issues/{issue_key}/transitions')
+        transitions = self._make_request('GET', f'/issue/{issue_key}/transitions')
 
         transition_id = None
         for t in transitions.get('transitions', []):
-            if t.get('to', {}).get('name', '').lower() == target_status.lower():
+            if (t.get('to') or {}).get('name', '').lower() == target_status.lower():
                 transition_id = t.get('id')
                 break
 
@@ -164,7 +297,7 @@ class JiraClient:
             return f"Status '{target_status}' not available for {issue_key}"
 
         payload = {'transition': {'id': transition_id}}
-        self._make_request('POST', f'/issues/{issue_key}/transitions', payload)
+        self._make_request('POST', f'/issue/{issue_key}/transitions', payload)
         return f"Transitioned {issue_key} to {target_status}"
 
     def search_issues(self, jql: str, max_results: int = 10) -> list:
@@ -177,7 +310,32 @@ class JiraClient:
 
         Returns:
             Lista de tickets encontrados
-        
+        """
+        # La API vieja /rest/api/3/search fue eliminada por Atlassian (HTTP 410).
+        # Hay que usar la nueva /rest/api/3/search/jql, que además requiere pedir
+        # explícitamente los 'fields' que se quieren de vuelta (antes venían todos por defecto).
+        query = urllib.parse.urlencode({
+            'jql': jql,
+            'maxResults': max_results,
+            'fields': 'summary,status,issuetype,assignee',
+        })
+        data = self._make_request('GET', f'/search/jql?{query}')
+
+        issues = []
+        for issue in data.get('issues', []):
+            fields = issue.get('fields', {})
+            issues.append({
+                'key': issue.get('key'),
+                'summary': fields.get('summary'),
+                'status': (fields.get('status') or {}).get('name'),
+                'type': (fields.get('issuetype') or {}).get('name'),
+                'assignee': (fields.get('assignee') or {}).get('displayName'),
+            })
+
+        return issues
+
+    def get_transitions(self, issue_key: str) -> list:
+        """
         Obtener transiciones disponibles para un ticket
 
         Args:
@@ -186,14 +344,14 @@ class JiraClient:
         Returns:
             Lista de transiciones disponibles
         """
-        data = self._make_request('GET', f'/issues/{issue_key}/transitions')
+        data = self._make_request('GET', f'/issue/{issue_key}/transitions')
 
         transitions = []
         for t in data.get('transitions', []):
             transitions.append({
                 'id': t.get('id'),
                 'name': t.get('name'),
-                'to': t.get('to', {}).get('name'),
+                'to': (t.get('to') or {}).get('name'),
             })
 
         return transitions

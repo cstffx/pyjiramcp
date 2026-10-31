@@ -3,33 +3,57 @@
 
 import sys
 import json
+import logging
 from typing import Any, Dict, List
 from jira_client import JiraClient
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[PyJiraMCP] %(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stderr
+)
+logger = logging.getLogger(__name__)
 
 
 class MCPServer:
     
 
     def __init__(self, config_path: str = "config.toml"):
+        logger.info(f"Inicializando MCPServer con config: {config_path}")
         self.client = JiraClient(config_path)
         self.request_id = 0
+        logger.info("MCPServer inicializado exitosamente")
 
     def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        
+
         method = request.get('method')
         params = request.get('params', {})
         request_id = request.get('id')
 
+        logger.debug(f"Request recibido - method: {method}, id: {request_id}")
+
         try:
             if method == 'initialize':
+                logger.info("Procesando initialize()")
                 result = self._handle_initialize()
             elif method == 'tools/list':
+                logger.info("Listando herramientas disponibles")
                 result = self._handle_tools_list()
             elif method == 'tools/call':
-                result = self._handle_tool_call(params)
+                tool_name = params.get('name', 'unknown')
+                logger.info(f"Llamando herramienta: {tool_name}")
+                tool_result = self._handle_tool_call(params)
+                result = {
+                    'content': [
+                        {'type': 'text', 'text': json.dumps(tool_result, ensure_ascii=False, indent=2)}
+                    ]
+                }
             else:
-                return self._error_response(request_id, f"Unknown method: {method}")
+                error_msg = f"Unknown method: {method}"
+                logger.warning(error_msg)
+                return self._error_response(request_id, error_msg)
 
+            logger.debug(f"Response enviado para {method}")
             return {
                 'jsonrpc': '2.0',
                 'id': request_id,
@@ -37,6 +61,7 @@ class MCPServer:
             }
 
         except Exception as e:
+            logger.error(f"Error en {method}: {str(e)}", exc_info=True)
             return self._error_response(request_id, str(e))
 
     def _handle_initialize(self) -> Dict[str, Any]:
@@ -159,6 +184,20 @@ class MCPServer:
                     },
                     'required': ['issue_key']
                 }
+            },
+            {
+                'name': 'jira_find_user',
+                'description': 'Buscar usuarios de Jira por email o nombre (devuelve su accountId)',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'query': {
+                            'type': 'string',
+                            'description': 'Email o nombre (parcial) a buscar'
+                        }
+                    },
+                    'required': ['query']
+                }
             }
         ]
 
@@ -202,6 +241,10 @@ class MCPServer:
             transitions = self.client.get_transitions(tool_params['issue_key'])
             return {'transitions': transitions}
 
+        elif tool_name == 'jira_find_user':
+            users = self.client.find_user(tool_params['query'])
+            return {'users': users}
+
         else:
             raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -217,18 +260,23 @@ class MCPServer:
         }
 
     def run(self):
-        
+        logger.info("=== PyJiraMCP Server iniciado, esperando requests ===")
+
         for line in sys.stdin:
             line = line.strip()
             if not line:
                 continue
 
             try:
+                logger.debug(f"Línea recibida: {line[:100]}...")
                 request = json.loads(line)
                 response = self.handle_request(request)
-                print(json.dumps(response))
+                response_str = json.dumps(response)
+                logger.debug(f"Enviando respuesta: {response_str[:100]}...")
+                print(response_str)
                 sys.stdout.flush()
             except json.JSONDecodeError as e:
+                logger.error(f"JSON Parse error: {e}")
                 error_response = {
                     'jsonrpc': '2.0',
                     'id': None,
